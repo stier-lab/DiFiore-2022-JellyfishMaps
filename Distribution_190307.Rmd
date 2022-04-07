@@ -1,0 +1,389 @@
+---
+title: "GAMS_Maps"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, include = F)
+```
+
+```{r libraries}
+
+library(rgdal)
+library(rgeos)
+library(sp)
+library(maptools)
+library(raster)
+library(sf)
+library(marmap)
+library(grid)
+library(gridBase)
+library(rworldmap)
+library(RColorBrewer)
+library(maps)  
+library(geosphere)
+library(ggplot2)
+library(zoo)
+library(fields)
+library(akima)
+library(colorRamps)
+library(dplyr)
+library(gstat) # For semivariograms and kriging
+library(spdep) # Useful package for Moran's I and similar methods
+library(lattice) # Used occasionally for plotting spatial
+library(ape) # What we will use for Moran's I today
+library(dismo) # for Voronoi polygons
+
+
+```
+
+```{r getupdated_dat}
+
+dat <- read.table("data/csvs/Jellies_2017.csv", header = T, sep = ",")
+
+coordinates(dat) <- ~ long + lat
+proj4string(dat) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs +towgs84=0,0,0" # Define projection system!
+
+df <- read.table("data/csvs/Jellies_2017.csv", header = T, sep = ",")
+
+```
+
+```{r aggregate data}
+
+#Subset to 1992 and later
+pr <- df
+
+#Assign period numbers
+pr$period <- ifelse(pr$year > 1981 & pr$year < 1991, 1,
+                    ifelse(pr$year >= 1991 & pr$year < 2001, 2, 
+                           ifelse(pr$year >= 2001 & pr$year < 2008, 3, 
+                                  ifelse(pr$year >= 2008 & pr$year < 2016, 4,
+                                         ifelse(pr$year >= 2016, 5, NA)))))
+
+#Assign "average" locations for each station, so that lat/long for a station is standaridized. 
+
+temp <- pr %>% 
+  group_by(stationid) %>%
+  summarize(long.ave = mean(long, na.rm = T), 
+            lat.ave = mean(lat, na.rm = T))
+
+# Aggregate to periods
+ag <- pr %>%
+  group_by(period, stationid) %>%
+  summarize(cpue = mean(wgtcpue_kg_ha, na.rm = TRUE),
+            long.ave = mean(long, na.rm = T), 
+            lat.ave = mean(lat, na.rm = T)
+  )
+
+ag <- as.data.frame(ag)
+
+mergefile <- data.frame(period = c(1,2,3,4,5), years = c("1982-1990", "1991-2000", "2001-2007", "2008-2015", "2016-2017"))
+
+ag <- merge(ag, mergefile)
+
+summary(ag$cpue, ag$years)
+
+```
+
+```{r assign_projection}
+
+coordinates(ag) <- ~ long.ave + lat.ave
+proj4string(ag) <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs +towgs84=0,0,0"
+
+crop <- readOGR("data/shapefiles/crop_WGS84.shp")
+
+ext <- extent(ag)
+ras <- raster(ext, nrow = 1000, ncol = 1000, crs = "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs +towgs84=0,0,0" )
+
+ras.grid <- as(ras, "SpatialGrid")
+
+
+
+```
+
+```{r variogram_setupforkrig}
+
+per1 <- ag[ag$period == 1, ]
+
+var.form <- variogram(log(cpue+1) ~ 1, per1)
+var.model <- fit.variogram(var.form, vgm(c("Exp", "Mat", "Sph", "Gau", "Ste")))
+var.model # Best model is a Matern w/ M. Stein's parameterization
+
+mod.line <- variogramLine(var.model, 500)
+show.vgms(models = "Ste", 0.01)
+
+plot(mod.line, main = "Semivariogram Model of Jelly abundance", cex = 0.8, 
+     type = "l")
+points(var.form[,2:3], pch=20, col='dark blue')
+
+k <- gstat(formula=log(cpue + 1)~ 1, locations=per1, model=var.model)
+  # then use this model to make predictions for every cell in the Meuse Grid
+
+cpue.kriging <- predict(k, ras.grid)
+cpue.kriging@data$transformed <- exp(cpue.kriging$var1.pred)
+
+out <- brick(cpue.kriging)
+#out3 <- crop(out, crop)
+out2 <- raster::mask(out, crop)
+
+plot(out2[[3]])
+```
+
+```{r forloop}
+
+
+# Look at which models are being used for each period.
+
+out <- list()
+for(i in 1:5){
+  per1 <- ag[ag$period == i, ]
+
+var.form <- variogram(log(cpue+1) ~ 1, per1)
+out[[i]] <- fit.variogram(var.form, vgm(c("Exp", "Mat", "Sph", "Gau", "Ste")))
+}
+
+
+# This takes a long time to run!!!
+
+# for(i in 1:5){
+#   per1 <- ag[ag$period == i, ]
+# 
+# var.form <- variogram(log(cpue+1) ~ 1, per1)
+# var.model <- fit.variogram(var.form, vgm(c("Exp", "Mat", "Sph", "Gau", "Ste")))
+# 
+# k <- gstat(formula=log(cpue + 1)~ 1, locations=per1, model=var.model)
+#   # then use this model to make predictions for every cell in the Meuse Grid
+# 
+# cpue.kriging <- predict(k, ras.grid)
+# cpue.kriging@data$transformed <- exp(cpue.kriging$var1.pred + 0.5 * (cpue.kriging$var1.var))
+# 
+# out <- brick(cpue.kriging)
+# out2 <- raster::mask(out, crop)
+# forplot <- out2$var1.pred
+# 
+# myfile <- file.path("rasters/", paste("rasterout2", "_", i, ".tif"))
+# writeRaster(forplot, myfile, overwrite=TRUE)
+# 
+# }
+
+
+
+```
+
+
+
+```{r}
+
+# Get rasters
+p1 <- raster("data/rasters/rasterout2_1.tif")
+p2 <- raster("data/rasters/rasterout2_2.tif")
+p3 <- raster("data/rasters/rasterout2_3.tif")
+p4 <- raster("data/rasters/rasterout2_4.tif")
+p5 <- raster("data/rasters/rasterout2_5.tif")
+
+#Reclassify and trasform rasters 
+m <- c(0, 0.01, 1, 0.01, 0.1, 2, 0.1, 0.5, 3, 0.5, 1, 4, 1, 2, 5, 2, 3, 6, 3, 7, 7, 7, 10^6, 8)
+rclmat <- matrix(m, ncol=3, byrow=TRUE)
+
+rasters <- c(p1, p2, p3, p4, p5) #compile into a list
+
+raster <- list()
+for(i in 1:length(rasters)){
+  temp <- exp(rasters[[i]])-1 #transform rasters
+  raster[i] <- reclassify(temp, rclmat) #reclassify rasters
+}
+names(raster) <- paste("p", seq(1,5),"tc", sep = "")
+
+
+```
+
+```{r}
+
+# Get alaska .shps
+
+ak <- readOGR("data/shapefiles/export_1508351020454/mv_alaska_1mil_py.shp")
+ak.rpj <- "+proj=aea +lat_1=55 +lat_2=65 +lat_0=50 +lon_0=-154 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+proj4string(ak) <- ak.rpj
+
+wgs <- "+proj=longlat +datum=WGS84 +no_defs"
+
+ak.wgs <- spTransform(ak, wgs)
+
+###########clip to AOI
+
+aoi.x <- c(-179.9, -155, -179.9, -155)
+aoi.y <- c(54, 54, 62, 62)
+aoi.mat <- cbind(aoi.x, aoi.y)
+
+aoi <- SpatialPoints(aoi.mat)
+
+ak.wgs <- crop(ak.wgs, extent(aoi))
+
+```
+
+```{r get bathy}
+
+##############bluild clipper
+
+clipbathy.x <- c(180.1, 206, 180.1, 206)
+clipbathy.y <- c(53, 53, 62, 62)
+clipbathy.mat <- cbind(clipbathy.x, clipbathy.y)
+clipbathy <- SpatialPoints(clipbathy.mat)
+
+#Get data
+bathy <- raster("data/bathy/crm_southak.nc")
+#bathy_clipper <- readOGR("shps/bathy_clipper.shp")
+bathy <- crop(bathy, clipbathy)
+bathy_spdf <- as(bathy, "SpatialPixelsDataFrame")
+bathy_df <- as.data.frame(bathy_spdf)
+colnames(bathy_df) <- c("z", "long", "lat")
+bathy_df <- bathy_df[bathy_df$long > 180, ]
+bathy_df$x <- -1*(180 - (bathy_df$long - 180))
+
+colnames(bathy_df) <- c("z", "long", "y", "x")
+bathy_df <- bathy_df[, c(4,3,1)]
+
+bathy <- rasterFromXYZ(bathy_df)
+proj4string(bathy) <- wgs
+
+slope = terrain(bathy, opt='slope')
+aspect = terrain(bathy, opt='aspect')
+hill <- hillShade(slope, aspect, 40, 270)
+hill <- crop(hill, extent(aoi))
+
+```
+
+```{r}
+#Prep for plotting
+years <- unique(ag$years) #extract years for plot names
+
+col.range <- c("white", "lightblue", "lightskyblue3", "steelblue", "green3", "yellow", "orange", "red")
+col.range2 <- c('#fff7ec','#fee8c8','#fdd49e','#fdbb84','#fc8d59','#ef6548','#d7301f','#990000')
+col.range3 <- rev(c('#d73027','#f46d43','#fdae61','#fee090','#e0f3f8','#abd9e9','#74add1','#4575b4'))
+
+col.range4 <- rev(c('#d53e4f','#f46d43','#fdae61','#fee08b','#ffffbf','#e6f598','#abdda4','#66c2a5','#3288bd'))
+
+labels=c(0, 0.01, 0.1, 0.5, 1, 2, 3, ">7")
+
+#Build contour clipper and object
+
+aoi.x <- c(-179.9, -155, -155, -179.9, -179.9)
+aoi.y <- c(54, 54, 62, 62, 54)
+forplot <- cbind(aoi.x, aoi.y)
+
+p <- Polygon(forplot)
+ps = Polygons(list(p),1)
+sps = SpatialPolygons(list(ps)) #clipper
+
+```
+
+
+
+```{r}
+
+# Write loop to plot each period
+
+for(i in 1:length(raster)){
+
+myfile <- file.path("figures/periods/", paste("period", "_", i, ".png", sep = ""))
+png(myfile, width = 1000, height = 1*650)
+  
+d <- par(las =1)
+plot(hill, col = gray.colors(30), legend = F,  npretty = 4, ext = aoi, cex.axis = 1, main = paste("Jellyfish Abundance", years[i]))
+plot(sps, col = alpha("#74a9cf", 0.3), add = T, border = NA)
+plot(raster[[i]], col = alpha(col.range3, 0.75), add = T, legend = F)
+plot(ag[ag$period == i, ], pch = 20, cex = 0.2, add = T, legend = F)
+plot(ak.wgs, col = alpha("gray50", 0.6), add = T, lwd = 0.8)
+contour(crop(bathy, sps), levels = c(-50,-100,-200), add = T, col = alpha("white", 0.7), drawlabels = F)
+# plot(p4, add=T, legend.only = T, col = col(30), 
+#      axis.args = list(at=log(labels), 
+#                       labels = labels, 
+#                       cex.axis = 0.9), 
+#      legend.args=list(text='CPUE (kg/ha)', side=3, font=2, line = 1, cex=1), 
+#      legend.mar = 4)
+par(d)
+
+dev.off()
+}
+```
+
+```{r}
+
+# Make the legend vertical
+
+xl <- 1
+yb <- 1
+xr <- 1.15
+yt <- 2
+
+svg("figures/legend.svg", width = , height = 10.3)
+#par(mar=c(5.1,0.5,4.1,0.5))
+plot(NA,type="n",ann=FALSE,xlim=c(1,2),ylim=c(1,2),xaxt="n",yaxt="n",bty="n")
+rect(
+  xl,
+  head(seq(yb,yt,(yt-yb)/8),-1),
+  xr,
+  tail(seq(yb,yt,(yt-yb)/8),-1),
+  col=col.range4
+)
+
+mtext(labels,side=2,at=tail(seq(yb,yt,(yt-yb)/8),-1)-0.05,las=2)
+dev.off()
+
+# Make the legend horizontal
+
+xl <- 1
+yb <- 1
+xr <- 2
+yt <- 1.1
+
+svg("figures/legend_horizontal.svg", width = 10, height = 6)
+#par(mar=c(5.1,0.5,4.1,0.5))
+plot(NA,type="n",ann=FALSE,xlim=c(1,2),ylim=c(1,2),xaxt="n",yaxt="n",bty="n")
+rect(
+  head(seq(xl,xr,(xr-xl)/8),-1),
+  yb,
+  tail(seq(xl,xr,(xr-xl)/8),-1),
+  yt,
+  col=col.range4
+)
+
+mtext(labels,side=1,at=tail(seq(xl,xr,(xr-xl)/8),-1)-0.05,las=1, cex = 1.3)
+dev.off()
+
+
+```
+
+```{r}
+svg("figures/sixpanel.svg", width = 11, height = 10.3)
+
+#c(bottom, left, top, right) 
+d <- par(las = 1, mfrow=c(3,2), mar = c(2,2,2,0))
+
+# Build single panel A "reference" map
+
+plot(hill, col = NA, legend = F,  npretty = 4, ext = aoi, cex.axis = 1)
+# plot(sps, col = alpha("#74a9cf", 0.3), add = T, border = NA)
+# plot(ag[ag$period == i, ], pch = 20, cex = 0.2, add = T, legend = F)
+plot(ak.wgs, col = alpha("gray50", 0.6), lwd = 0.8, add = T)
+contour(crop(bathy, sps), levels = c(-50,-100,-200), add = T, drawlabels = T, ext = aoi, labcex = 1)
+
+for(i in 1:length(raster)){
+
+plot(hill, col = gray.colors(30), legend = F,  npretty = 4, cex.axis = 1)
+plot(sps, col = alpha("#74a9cf", 0.3), add = T, border = NA)
+plot(raster[[i]], col = alpha(col.range4, 0.75), add = T, legend = F)
+plot(ag[ag$period == i, ], pch = 20, cex = 0.2, add = T, legend = F)
+plot(ak.wgs, col = alpha("gray50", 0.6), add = T, lwd = 0.8)
+contour(crop(bathy, sps), levels = c(-50,-100,-200), add = T, col = alpha("white", 0.7), drawlabels = F)
+text(-177.5, 55, labels = paste("max =", round(max(ag$cpue[ag$period == i]), 1)), cex = 1.5, pos = 4)
+
+}
+      
+par(d)
+dev.off()
+
+
+```
+
